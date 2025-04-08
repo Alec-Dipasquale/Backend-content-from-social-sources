@@ -1,7 +1,7 @@
 import * as admin from "firebase-admin";
 import {onSchedule} from "firebase-functions/v2/scheduler";
 import {generateThumbnailInternal} from "./generate-thumbnail";
-import {validateImageUrl} from "./image-utils";
+// import {validateImageUrl} from "./image-utils"; // Removed unused import
 import fetch from "node-fetch";
 
 // Initialize Firebase Admin
@@ -9,8 +9,8 @@ admin.initializeApp();
 
 // Constants for processing
 const MAX_RETRIES = 3;
-const BATCH_SIZE = 3; // Reduced from 5 to 3 to manage memory better
-const MEMORY_LIMIT = 200 * 1024 * 1024; // 200MB threshold (to stay under 256MB limit)
+const BATCH_SIZE = 50; // Increased from 3 to 50
+const MEMORY_LIMIT = 200 * 1024 * 1024; // 200MB threshold
 
 const subreddits = [
   "CrazyFuckingVideos",
@@ -18,6 +18,15 @@ const subreddits = [
   "PublicFreakout",
   "unexpected",
   "interestingasfuck",
+  // Added more video subreddits:
+  "videos",
+  "AbruptChaos",
+  "IdiotsInCars",
+  "Whatcouldgowrong",
+  "BeAmazed",
+  "toptalent",
+  "WinStupidPrizes",
+  "holdmybeer",
 ];
 
 interface RedditPost {
@@ -30,6 +39,11 @@ interface RedditPost {
     is_video: boolean;
     subreddit: string;
     thumbnail: string;
+    over_18: boolean;
+    score: number;
+    num_comments: number;
+    author: string;
+    upvote_ratio: number;
     preview?: {
       images: Array<{
         source: {
@@ -43,6 +57,7 @@ interface RedditPost {
           height: number;
         }>;
       }>;
+      enabled?: boolean;
     };
     media?: {
       type?: string;
@@ -132,6 +147,14 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
         }
 
         const docId = postData.permalink.replace(/[^\w]/g, "_");
+
+        const docRef = db.collection("redditVideos").doc(docId);
+        const docSnap = await docRef.get();
+        if (docSnap.exists) {
+          console.log(`⏭️ Skipping already processed post: ${postData.title} (${docId})`);
+          continue; // Skip if document already exists
+        }
+
         console.log(`🎥 Processing video post: ${postData.title} (${docId})`);
 
         try {
@@ -142,7 +165,6 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
 
           // Save to Firestore
           console.log(`💾 Saving to Firestore: ${docId}`);
-          const docRef = db.collection("redditVideos").doc(docId);
           await docRef.set({
             title: postData.title,
             url: postData.url,
@@ -153,6 +175,12 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
             video_url: postData.media?.reddit_video?.hls_url || videoUrl,
             subreddit: postData.subreddit,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            nsfw: postData.over_18,
+            score: postData.score,
+            comments: postData.num_comments,
+            author: postData.author,
+            upvoteRatio: postData.upvote_ratio,
+            previewData: postData.preview,
           }, {merge: true});
 
           // Verify the document was saved
@@ -201,7 +229,7 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
 
 // Main scheduled function to fetch Reddit feed
 export const fetchRedditFeed = onSchedule({
-  schedule: "every 60 minutes",
+  schedule: "every 6 hours", // Changed from every 60 minutes
   retryCount: MAX_RETRIES,
   timeoutSeconds: 540, // 9 minutes
   memory: "512MiB", // Increase memory allocation
@@ -240,69 +268,4 @@ export const fetchRedditFeed = onSchedule({
     errorCount,
     timestamp: admin.firestore.FieldValue.serverTimestamp(),
   });
-});
-
-// Thumbnail generation function for posts that need it
-export const scheduledFunction = onSchedule({
-  schedule: "every 5 minutes",
-  retryCount: MAX_RETRIES,
-  timeoutSeconds: 540, // 9 minutes
-}, async () => {
-  const db = admin.firestore();
-  const postsRef = db.collection("posts");
-
-  try {
-    const snapshot = await postsRef
-      .where("thumbnailUrl", "==", null)
-      .limit(10)
-      .get();
-
-    if (snapshot.empty) {
-      console.log("No posts found needing thumbnails");
-      return;
-    }
-
-    for (const doc of snapshot.docs) {
-      const post = doc.data();
-
-      try {
-        // Try to generate thumbnail from video
-        const thumbnailUrl = await generateThumbnailInternal(post.url, doc.id);
-
-        await doc.ref.update({
-          thumbnailUrl,
-          thumbnailError: null,
-        });
-
-        console.log(`Generated thumbnail for post ${doc.id}`);
-      } catch (error: unknown) {
-        console.error(`Error generating thumbnail for post ${doc.id}:`, error);
-
-        // If thumbnail generation fails, try to validate and use the preview image
-        if (post.previewUrl) {
-          try {
-            const isValid = await validateImageUrl(post.previewUrl);
-            if (isValid) {
-              await doc.ref.update({
-                thumbnailUrl: post.previewUrl,
-                thumbnailError: null,
-              });
-              console.log(`Using preview image for post ${doc.id}`);
-              continue;
-            }
-          } catch (validationError) {
-            console.error(`Error validating preview image for post ${doc.id}:`, validationError);
-          }
-        }
-
-        // If all attempts fail, mark the error
-        await doc.ref.update({
-          thumbnailError: error instanceof Error ? error.message : "Unknown error",
-        });
-      }
-    }
-  } catch (error: unknown) {
-    console.error("Error in scheduled function:", error);
-    throw error;
-  }
 });
