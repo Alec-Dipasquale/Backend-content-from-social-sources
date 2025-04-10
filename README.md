@@ -1,26 +1,19 @@
-# Video Thumbnail Generator
+# Reddit Video Thumbnail Generator
 
-A robust Firebase Cloud Function service that automatically generates high-quality thumbnails from video URLs. Built with TypeScript and FFmpeg, this service handles videos of any aspect ratio and creates optimized thumbnails without distortion.
+A Firebase Cloud Function service that automatically fetches Reddit videos and generates high-quality thumbnails. Built with TypeScript and FFmpeg, this service processes Reddit videos and stores them in Firebase Storage with optimized thumbnails.
 
 ## Features
 
-- 🎯 Smart aspect ratio detection (handles everything from ultrawide to tall portrait videos)
-- 🖼️ Adaptive thumbnail sizing with 5 optimized formats:
-  - Landscape (16:9)
-  - Wide (4:3)
-  - Square (1:1)
-  - Tall (3:4)
-  - Portrait (9:16)
-- 🔄 Efficient processing using FFmpeg stream seeking
-- ☁️ Firebase Storage integration with signed URLs
-- 🎨 High-quality JPEG output (640p base dimension)
-- 📊 Comprehensive logging system with emoji indicators
+- 🎥 Automatic Reddit video processing
+- 🖼️ High-quality thumbnail generation
+- 🎯 Support for Reddit's DASH video format
+- 🔄 Scheduled post fetching from multiple subreddits (runs every 6 hours)
+- ☁️ Firebase Storage integration with public URLs
+- 📊 Comprehensive metadata storage in Firestore
 - 🛡️ Advanced error handling and recovery
-- 🔍 Memory usage monitoring and optimization
-- 🔄 Batch processing with configurable sizes
-- ☁️ Firebase Storage integration with signed URLs
-- 🎨 High-quality JPEG output with smart compression
-- 🛡️ Error handling and cleanup of temporary files
+- 🔍 Memory usage monitoring
+- 🔄 Configurable batch processing
+- 🧹 Automatic cleanup of temporary files
 
 ## Tech Stack
 
@@ -29,6 +22,41 @@ A robust Firebase Cloud Function service that automatically generates high-quali
 - FFmpeg for video processing
 - Firebase Admin SDK
 - Firebase Storage
+- Firestore
+
+## Prerequisites
+
+- Node.js 18 or later
+- Firebase CLI
+- FFmpeg installed on your system
+
+## Environment Setup
+
+1. Create a `.env` file in the root directory with the following variables:
+```bash
+# Firebase Configuration
+FIREBASE_PROJECT_ID=your-project-id
+FIREBASE_STORAGE_BUCKET=${FIREBASE_PROJECT_ID}.firebasestorage.app
+
+# Function Configuration
+NODE_ENV=production
+FUNCTION_REGION=us-central1
+FUNCTION_MEMORY=256MB
+FUNCTION_TIMEOUT=60s
+```
+
+2. Update your Firebase Storage rules in `storage.rules`:
+```
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read: if true;  // Public read access
+      allow write: if false; // No public write access
+    }
+  }
+}
+```
 
 ## Getting Started
 
@@ -49,54 +77,53 @@ firebase init
 npm run deploy
 ```
 
-## Usage
+## Configuration
 
-The service exposes a callable Cloud Function that accepts:
+The function is configured to process videos from the following subreddits:
+- CrazyFuckingVideos
+- nextfuckinglevel
+- PublicFreakout
+- unexpected
+- interestingasfuck
+- videos
+- AbruptChaos
+- IdiotsInCars
+- Whatcouldgowrong
+- BeAmazed
+- toptalent
+- WinStupidPrizes
+- holdmybeer
+
+To modify the subreddit list, edit the `subreddits` array in `functions/src/index.ts`.
+
+## Data Structure
+
+The function stores the following data for each video:
 
 ```typescript
-interface ThumbnailData {
-  videoUrl: string;
-  videoId: string;
+interface VideoData {
+  title: string;
+  url: string;
+  thumbnail: string;
+  permalink: string;
+  created: number;
+  is_video: boolean;
+  video_url: string;
+  video_source: "reddit";
+  video_height: number | null;
+  video_width: number | null;
+  duration: number | null;
+  bitrate: number | null;
+  is_gif: boolean;
+  has_audio: boolean;
+  subreddit: string;
+  nsfw: boolean;
+  score: number;
+  comments: number;
+  author: string;
+  upvoteRatio: number;
 }
 ```
-
-And returns:
-
-```typescript
-interface ThumbnailResponse {
-  thumbnailUrl: string;
-}
-```
-
-Example usage:
-
-```typescript
-const result = await functions.httpsCallable('generateThumbnail')({
-  videoUrl: 'https://example.com/video.mp4',
-  videoId: 'unique-video-id'
-});
-
-console.log(result.data.thumbnailUrl);
-```
-
-## Architecture
-
-The service uses a multi-step process:
-1. Analyzes the video's aspect ratio to determine the optimal thumbnail dimensions
-2. Extracts a frame from the 50% mark of the video duration using FFmpeg
-3. Processes and uploads the thumbnail to Firebase Storage
-4. Returns a signed URL valid for one year
-5. Stores metadata including original and final dimensions
-
-## Performance
-
-- Minimal memory footprint using stream processing
-- Memory usage monitoring with automatic garbage collection
-- Configurable batch sizes for optimal performance
-- Smart delays between operations to prevent rate limiting
-- Fast thumbnail generation by seeking directly to target frame
-- Efficient cleanup of temporary files
-- Optimized for Cloud Functions execution environment
 
 ## Monitoring and Logging
 
@@ -112,7 +139,6 @@ Error tracking includes:
 - Memory usage monitoring
 - Database operation verification
 - Detailed error logs with context
-- Automatic retry mechanisms
 
 ## Contributing
 
