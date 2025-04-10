@@ -1,11 +1,32 @@
 import * as admin from "firebase-admin";
 import {onSchedule} from "firebase-functions/v2/scheduler";
-import {generateThumbnailInternal} from "./generate-thumbnail";
+// import {generateThumbnailInternal} from "./generate-thumbnail"; // Removed unused import
 // import {validateImageUrl} from "./image-utils"; // Removed unused import
-import fetch from "node-fetch";
+import fetch, {RequestInit} from "node-fetch";
+import {generateLocalThumbnail} from "./thumbnail-generator";
+import * as fs from "fs";
+import {promisify} from "util";
+import * as os from "os";
+import * as path from "path";
+import * as dotenv from "dotenv";
 
-// Initialize Firebase Admin
-admin.initializeApp();
+// Load environment variables
+dotenv.config();
+
+// Initialize Firebase Admin if not already initialized
+if (!admin.apps.length) {
+  admin.initializeApp({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET
+  });
+}
+
+// Initialize Storage bucket
+const bucket = admin.storage().bucket();
+
+// Promisify fs functions
+const unlink = promisify(fs.unlink);
+const mkdir = promisify(fs.mkdir);
 
 // Constants for processing
 const MAX_RETRIES = 3;
@@ -66,6 +87,10 @@ interface RedditPost {
         hls_url: string;
         height: number;
         width: number;
+        dash_url: string;
+        duration: number;
+        bitrate_kbps: number;
+        is_gif: boolean;
       };
     };
   };
@@ -78,15 +103,6 @@ interface RedditResponse {
     after: string | null;
     before: string | null;
   };
-}
-
-// Helper function to validate video URL
-function isValidVideoUrl(url: string | undefined): url is string {
-  return typeof url === "string" && url.length > 0 && (
-    url.endsWith(".mp4") ||
-    url.includes("v.redd.it") ||
-    url.includes("reddit.com/video")
-  );
 }
 
 // Helper function to check memory usage
@@ -110,7 +126,7 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
         headers: {
           "User-Agent": "Mozilla/5.0 (compatible; LauncherBot/1.0)",
         },
-        signal: controller.signal,
+        signal: controller.signal as RequestInit["signal"],
       }
     );
 
@@ -135,73 +151,121 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
         checkMemoryUsage(); // Check memory before processing each post
 
         const postData = post.data;
-        if (!postData.is_video) {
-          console.log(`⏭️ Skipping non-video post: ${postData.title}`);
+
+        // Check if it's a native Reddit video
+        const isRedditVideo = postData.is_video && postData.media?.reddit_video?.fallback_url;
+
+        let finalThumbnailUrl = null;
+        let videoUrl = null;
+
+        if (isRedditVideo && postData.media?.reddit_video?.fallback_url) {
+          // Use fallback URL for thumbnail generation
+          const thumbnailVideoUrl = postData.media.reddit_video.fallback_url;
+          videoUrl = postData.media.reddit_video.dash_url || postData.media.reddit_video.fallback_url;
+          const isGif = postData.media.reddit_video.is_gif || false;
+
+          console.log(`🎥 Reddit video detected - ${isGif ? "GIF type" : "Regular video"}`);
+
+          try {
+            console.log(`🔄 Starting thumbnail generation for Reddit video: ${thumbnailVideoUrl}`);
+
+            // Create a temporary directory for this run
+            const tempDir = path.join(os.tmpdir(), "reddit-thumbnails");
+            await mkdir(tempDir, {recursive: true}).catch((err) => console.log("Directory exists:", err));
+
+            // Generate thumbnail
+            const thumbnailPath = await generateLocalThumbnail(thumbnailVideoUrl, postData.permalink, tempDir);
+            console.log(`✅ Thumbnail generated at path: ${thumbnailPath}`);
+
+            // Upload to Firebase Storage
+            const uploadPath = `thumbnails/${Date.now()}_${path.basename(thumbnailPath)}`;
+            await bucket.upload(thumbnailPath, {
+              destination: uploadPath,
+              metadata: {
+                contentType: "image/jpeg",
+                cacheControl: "public, max-age=31536000", // Cache for 1 year
+              },
+              public: true,
+              predefinedAcl: "publicRead",
+            });
+
+            // Use direct public URL instead of signed URL
+            finalThumbnailUrl = `https://storage.googleapis.com/${bucket.name}/${uploadPath}`;
+            console.log(`✅ Thumbnail uploaded to Storage: ${finalThumbnailUrl}`);
+
+            // Clean up temp file
+            await unlink(thumbnailPath).catch((err) => console.log("Cleanup error:", err));
+          } catch (error) {
+            console.error("❌ Failed to generate/upload Reddit video thumbnail:", error);
+            console.log("⏭️ Skipping post due to thumbnail generation failure");
+            continue;
+          }
+        } else {
+          // Skip if not a Reddit video
+          console.log(`⏭️ Skipping non-video post or unsupported video type: ${postData.title}`);
           continue;
         }
 
-        const videoUrl = postData.media?.reddit_video?.fallback_url;
-        if (!isValidVideoUrl(videoUrl)) {
-          console.log(`⏭️ Skipping post with invalid video URL: ${postData.title}`);
+        // Skip if we don't have a thumbnail
+        if (!finalThumbnailUrl) {
+          console.log(`⏭️ Skipping post due to missing thumbnail: ${postData.title}`);
           continue;
         }
 
         const docId = postData.permalink.replace(/[^\w]/g, "_");
 
+        // Firestore Check
         const docRef = db.collection("redditVideos").doc(docId);
         const docSnap = await docRef.get();
         if (docSnap.exists) {
           console.log(`⏭️ Skipping already processed post: ${postData.title} (${docId})`);
-          continue; // Skip if document already exists
+          continue;
         }
 
-        console.log(`🎥 Processing video post: ${postData.title} (${docId})`);
+        console.log(`💾 Preparing to save video post: ${postData.title} (${docId})`);
 
         try {
-          // Try to generate thumbnail from video
-          console.log(`🎬 Generating thumbnail for: ${postData.title}`);
-          const thumbnailUrl = await generateThumbnailInternal(videoUrl, docId);
-          console.log(`✅ Generated thumbnail URL: ${thumbnailUrl}`);
-
-          // Save to Firestore
-          console.log(`💾 Saving to Firestore: ${docId}`);
-          await docRef.set({
+          // Prepare document data, ensuring no undefined values
+          const docData = {
             title: postData.title,
             url: postData.url,
-            thumbnail: thumbnailUrl,
+            thumbnail: finalThumbnailUrl,
             permalink: postData.permalink,
             created: postData.created_utc,
-            is_video: postData.is_video,
-            video_url: postData.media?.reddit_video?.hls_url || videoUrl,
+            is_video: Boolean(postData.is_video),
+            video_url: videoUrl,
+            video_source: "reddit",
+            video_height: postData.media?.reddit_video?.height || null,
+            video_width: postData.media?.reddit_video?.width || null,
+            duration: postData.media?.reddit_video?.duration || null,
+            bitrate: postData.media?.reddit_video?.bitrate_kbps || null,
+            is_gif: postData.media?.reddit_video?.is_gif || false,
+            has_audio: Boolean(postData.media?.reddit_video?.dash_url && !postData.media?.reddit_video?.is_gif),
             subreddit: postData.subreddit,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            nsfw: postData.over_18,
-            score: postData.score,
-            comments: postData.num_comments,
-            author: postData.author,
-            upvoteRatio: postData.upvote_ratio,
-            previewData: postData.preview,
-          }, {merge: true});
-
-          // Verify the document was saved
-          const savedDoc = await docRef.get();
-          if (!savedDoc.exists) {
-            throw new Error("Document was not saved successfully");
-          }
-
-          console.log(`✅ Successfully saved post: ${postData.title}`);
-        } catch (error) {
-          console.error(`❌ Failed to process ${postData.title}:`, error);
-          // Log additional details for debugging
-          console.error("Post details:", {
-            title: postData.title,
-            videoUrl,
-            is_video: postData.is_video,
+            nsfw: Boolean(postData.over_18),
+            score: postData.score || 0,
+            comments: postData.num_comments || 0,
+            author: postData.author || "[deleted]",
+            upvoteRatio: postData.upvote_ratio || 1.0,
             has_media: Boolean(postData.media),
-            media_type: postData.media?.type,
-            docId,
+            media_type: postData.media?.type || null,
+            postId: docId,
+          };
+
+          // Save to Firestore
+          await docRef.set(docData, {merge: true});
+
+          console.log(`✅ Successfully saved Reddit video post to Firestore: ${postData.title}`);
+        } catch (saveError) {
+          console.error("❌ Failed to save post to Firestore:", {
+            error: saveError,
+            postId: docId,
+            title: postData.title,
+            errorMessage: saveError instanceof Error ? saveError.message : "Unknown error",
+            errorStack: saveError instanceof Error ? saveError.stack : undefined,
           });
-          throw error; // Re-throw to track in error count
+          throw saveError;
         }
 
         // Force garbage collection between posts
@@ -215,8 +279,8 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
         if (error instanceof Error && error.message.includes("Memory usage too high")) {
           throw error; // Re-throw memory errors to stop processing
         }
-        console.error("Error processing post:", error);
-        throw error; // Re-throw to track in error count
+        console.error("Error in outer post processing loop:", error);
+        // Don't re-throw here, allow loop to continue
       }
     }
 

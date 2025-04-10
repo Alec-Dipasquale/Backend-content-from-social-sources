@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "module": "CommonJS",
+    "module": "commonjs",
     "noImplicitReturns": true,
     "noUnusedLocals": true,
     "outDir": "lib",
@@ -8,8 +8,8 @@
     "strict": true,
     "target": "es2017",
     "esModuleInterop": true,
-    "moduleResolution": "node",
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "moduleResolution": "node"
   },
   "compileOnSave": true,
   "include": [
