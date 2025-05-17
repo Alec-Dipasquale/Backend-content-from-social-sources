@@ -1,11 +1,9 @@
 import * as admin from "firebase-admin";
-import {onSchedule} from "firebase-functions/v2/scheduler";
-// import {generateThumbnailInternal} from "./generate-thumbnail"; // Removed unused import
-// import {validateImageUrl} from "./image-utils"; // Removed unused import
+import * as functions from "firebase-functions";
 import fetch, {RequestInit} from "node-fetch";
 import {generateLocalThumbnail} from "./thumbnail-generator";
 import * as fs from "fs";
-import {promisify} from "util";
+import * as util from "util";
 import * as os from "os";
 import * as path from "path";
 import * as dotenv from "dotenv";
@@ -16,8 +14,8 @@ dotenv.config();
 // Initialize Firebase Admin if not already initialized
 if (!admin.apps.length) {
   admin.initializeApp({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET
+    projectId: "launcher-backend-98221",
+    storageBucket: "launcher-backend-98221.firebasestorage.app",
   });
 }
 
@@ -25,11 +23,10 @@ if (!admin.apps.length) {
 const bucket = admin.storage().bucket();
 
 // Promisify fs functions
-const unlink = promisify(fs.unlink);
-const mkdir = promisify(fs.mkdir);
+const unlink = util.promisify(fs.unlink);
+const mkdir = util.promisify(fs.mkdir);
 
 // Constants for processing
-const MAX_RETRIES = 3;
 const BATCH_SIZE = 50; // Increased from 3 to 50
 const MEMORY_LIMIT = 200 * 1024 * 1024; // 200MB threshold
 
@@ -120,14 +117,16 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
 
+    const fetchOptions: RequestInit = {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; LauncherBot/1.0)",
+      },
+      signal: controller.signal as any, // Type assertion to avoid type mismatch
+    };
+
     const response = await fetch(
       `https://www.reddit.com/r/${subreddit}/top.json?limit=${BATCH_SIZE}&t=day`,
-      {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; LauncherBot/1.0)",
-        },
-        signal: controller.signal as RequestInit["signal"],
-      }
+      fetchOptions
     );
 
     clearTimeout(timeoutId);
@@ -157,6 +156,14 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
 
         let finalThumbnailUrl = null;
         let videoUrl = null;
+
+        const docId = postData.permalink.replace(/[^\w]/g, "_");
+        const docRef = db.collection("redditVideos").doc(docId);
+        const docSnap = await docRef.get();
+        if (docSnap.exists) {
+          console.log(`⏭️ Skipping already processed post: ${postData.title} (${docId})`);
+          continue;
+        }
 
         if (isRedditVideo && postData.media?.reddit_video?.fallback_url) {
           // Use fallback URL for thumbnail generation
@@ -212,16 +219,6 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
           continue;
         }
 
-        const docId = postData.permalink.replace(/[^\w]/g, "_");
-
-        // Firestore Check
-        const docRef = db.collection("redditVideos").doc(docId);
-        const docSnap = await docRef.get();
-        if (docSnap.exists) {
-          console.log(`⏭️ Skipping already processed post: ${postData.title} (${docId})`);
-          continue;
-        }
-
         console.log(`💾 Preparing to save video post: ${postData.title} (${docId})`);
 
         try {
@@ -251,6 +248,7 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
             has_media: Boolean(postData.media),
             media_type: postData.media?.type || null,
             postId: docId,
+            tagVersion: 0, // Always set to 0
           };
 
           // Save to Firestore
@@ -292,44 +290,47 @@ async function processSubreddit(subreddit: string, db: admin.firestore.Firestore
 }
 
 // Main scheduled function to fetch Reddit feed
-export const fetchRedditFeed = onSchedule({
-  schedule: "every 6 hours", // Changed from every 60 minutes
-  retryCount: MAX_RETRIES,
-  timeoutSeconds: 540, // 9 minutes
-  memory: "512MiB", // Increase memory allocation
-}, async () => {
-  const db = admin.firestore();
-  let processedCount = 0;
-  let errorCount = 0;
-
-  // Process one subreddit at a time
-  for (const subreddit of subreddits) {
+export const fetchRedditFeed = functions.pubsub.schedule("every 6 hours")
+  .timeZone("America/New_York")
+  .onRun(async () => {
     try {
-      checkMemoryUsage();
-      await processSubreddit(subreddit, db);
-      processedCount++;
+      console.log("Starting scheduled Reddit fetch...");
+      const db = admin.firestore();
+      let processedCount = 0;
+      let errorCount = 0;
 
-      // Force garbage collection between subreddits
-      if (global.gc) {
-        global.gc();
+      // Process one subreddit at a time
+      for (const subreddit of subreddits) {
+        try {
+          checkMemoryUsage();
+          await processSubreddit(subreddit, db);
+          processedCount++;
+
+          // Force garbage collection between subreddits
+          if (global.gc) {
+            global.gc();
+          }
+        } catch (error) {
+          errorCount++;
+          console.error(`❌ Error processing r/${subreddit}:`, error);
+          if (error instanceof Error && error.message.includes("Memory usage too high")) {
+            break; // Stop processing if we hit memory limits
+          }
+        }
+        // Add a larger delay between subreddits
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
+
+      console.log(`🏁 Finished processing: ${processedCount} successful, ${errorCount} failed`);
+
+      // Write stats to Firestore
+      await db.collection("stats").doc("fetchRedditFeed").set({
+        processedCount,
+        errorCount,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
     } catch (error) {
-      errorCount++;
-      console.error(`❌ Error processing r/${subreddit}:`, error);
-      if (error instanceof Error && error.message.includes("Memory usage too high")) {
-        break; // Stop processing if we hit memory limits
-      }
+      console.error("❌ Error in scheduled Reddit fetch:", error);
+      throw error; // Re-throw to handle in the main function
     }
-    // Add a larger delay between subreddits
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-  }
-
-  console.log(`🏁 Finished processing: ${processedCount} successful, ${errorCount} failed`);
-
-  // Write stats to Firestore
-  await db.collection("stats").doc("fetchRedditFeed").set({
-    processedCount,
-    errorCount,
-    timestamp: admin.firestore.FieldValue.serverTimestamp(),
   });
-});

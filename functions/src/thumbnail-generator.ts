@@ -1,6 +1,5 @@
 import ffmpeg from "fluent-ffmpeg";
-import * as fs from "fs/promises";
-import * as fsCallback from "fs";
+import * as fs from "fs";
 import * as path from "path";
 import * as https from "https";
 import * as crypto from "crypto";
@@ -18,7 +17,7 @@ export async function generateLocalThumbnail(
 
   // Create directory if it doesn't exist
   try {
-    await fs.mkdir(tempDir, {recursive: true});
+    await fs.promises.mkdir(tempDir, {recursive: true});
     console.log("✅ Thumbnail directory created or already exists");
   } catch (mkdirError) {
     console.error("❌ Error creating directory:", mkdirError);
@@ -57,7 +56,7 @@ export async function generateLocalThumbnail(
 
     // Clean up the temporary video file
     try {
-      await fs.unlink(tempVideoPath);
+      await fs.promises.unlink(tempVideoPath);
       console.log("✅ Temporary video file cleaned up");
     } catch (unlinkError) {
       console.error("⚠️ Error cleaning up temporary video file:", unlinkError);
@@ -66,7 +65,7 @@ export async function generateLocalThumbnail(
 
     // Verify thumbnail exists
     try {
-      await fs.access(thumbnailPath);
+      await fs.promises.access(thumbnailPath);
       console.log(`✅ Thumbnail file exists at: ${thumbnailPath}`);
       return thumbnailPath;
     } catch (error) {
@@ -77,10 +76,10 @@ export async function generateLocalThumbnail(
     console.error("❌ Error generating thumbnail:", error);
     // Try to clean up any leftover files
     try {
-      await fs.unlink(tempVideoPath).catch((err) => {
+      await fs.promises.unlink(tempVideoPath).catch((err) => {
         console.error("⚠️ Error cleaning up temp video file:", err);
       });
-      await fs.unlink(thumbnailPath).catch((err) => {
+      await fs.promises.unlink(thumbnailPath).catch((err) => {
         console.error("⚠️ Error cleaning up thumbnail file:", err);
       });
     } catch (cleanupError) {
@@ -92,7 +91,7 @@ export async function generateLocalThumbnail(
 
 function downloadFile(url: string, dest: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const file = fsCallback.createWriteStream(dest);
+    const file = fs.createWriteStream(dest);
 
     https.get(url, (response) => {
       if (response.statusCode !== 200) {
@@ -110,14 +109,14 @@ function downloadFile(url: string, dest: string): Promise<void> {
 
       file.on("error", (err) => {
         file.close();
-        fs.unlink(dest).catch((unlinkErr) => {
+        fs.promises.unlink(dest).catch((unlinkErr) => {
           console.error("⚠️ Error cleaning up failed download:", unlinkErr);
         });
         reject(err);
       });
     }).on("error", (err) => {
       file.close();
-      fs.unlink(dest).catch((unlinkErr) => {
+      fs.promises.unlink(dest).catch((unlinkErr) => {
         console.error("⚠️ Error cleaning up after network error:", unlinkErr);
       });
       reject(err);
